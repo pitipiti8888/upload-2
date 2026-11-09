@@ -1,0 +1,60 @@
+// Testa o modo desktop do servidor (DESKTOP=1): arquivos usados no lugar, saída em pasta escolhida, segurança.  Uso: node test/desktop.js
+const { spawn, execFileSync: x, spawnSync } = require('child_process'), fs = require('fs'), os = require('os'), path = require('path'), http = require('http'), crypto = require('crypto');
+const T = fs.mkdtempSync(path.join(os.tmpdir(), 'carimbo-desk-')), PORT = 3800 + Math.floor(Math.random() * 90), B = `http://127.0.0.1:${PORT}`;
+const [DATA, OUT, SRC1, SRC2] = ['dados', 'finais', 'origem1', 'origem2'].map(d => { const p = path.join(T, d); fs.mkdirSync(p); return p; });
+let fails = 0; const ok = (c, m, d = '') => { console.log(`  ${c ? '✔' : '✘'} ${m}${d ? '  (' + d + ')' : ''}`); if (!c) fails++; };
+const mk = (p, ...a) => x('ffmpeg', ['-v', 'error', '-y', ...a, p]);
+const sha = p => crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex');
+const V = path.join(SRC1, 'a.mp4'), V2 = path.join(SRC2, 'a.mp4'), WM = path.join(SRC1, 'marca.png'), OU = path.join(SRC1, 'fim.mp4'), TXT = path.join(SRC1, 'nota.txt');
+mk(V, '-f', 'lavfi', '-i', 'color=c=0x203040:s=1280x720:r=30:d=3', '-f', 'lavfi', '-i', 'sine=d=3', '-shortest', '-pix_fmt', 'yuv420p');
+mk(V2, '-f', 'lavfi', '-i', 'color=c=0xcc3377:s=720x1280:r=25:d=2', '-pix_fmt', 'yuv420p');
+mk(WM, '-f', 'lavfi', '-i', 'color=c=0x00ff00:s=400x160', '-vf', 'drawbox=x=20:y=30:w=360:h=100:color=white:t=fill', '-frames:v', '1');
+mk(OU, '-f', 'lavfi', '-i', 'color=c=navy:s=640x360:r=24:d=2', '-f', 'lavfi', '-i', 'sine=f=880:d=2', '-shortest', '-pix_fmt', 'yuv420p');
+fs.writeFileSync(TXT, 'isto não é vídeo');
+const before = Object.fromEntries([V, V2, WM, OU].map(p => [p, sha(p)]));
+const srv = (env = {}) => { const p = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], { env: { ...process.env, DESKTOP: '1', PORT, DATA_DIR: DATA, OUT_DIR: OUT, ...env }, stdio: 'ignore' }); return p; };
+const up = async () => { for (let i = 0; i < 60; i++) { try { await fetch(B + '/api/state'); return; } catch { await new Promise(r => setTimeout(r, 100)); } } throw new Error('servidor não subiu'); };
+const call = async (m, u, b, h = { 'X-Carimbo': '1' }) => { const r = await fetch(B + u, { method: m, headers: { 'Content-Type': 'application/json', ...h }, body: b && JSON.stringify(b) }); return Object.assign(await r.json().catch(() => ({})), { _s: r.status }); };
+const reg = (role, p) => call('POST', '/api/register', { role, path: p });
+const wait = async () => { let s; for (let n = 0; n < 240; n++) { s = await call('GET', '/api/state'); if (s.jobs.length && s.jobs.every(k => k.status === 'done' || k.status === 'error')) return s; await new Promise(r => setTimeout(r, 500)); } return s; };
+(async () => {
+  let p = srv(); await up();
+  console.log('1) Segurança do servidor local');
+  ok((await call('POST', '/api/config', { color: '#00ff00' }, {}))._s === 403, 'POST sem o cabeçalho do aplicativo é bloqueado (página de fora não consegue comandar)');
+  const hostBad = await new Promise(r => http.get({ port: PORT, host: '127.0.0.1', path: '/api/state', headers: { Host: 'site-malicioso.com' } }, res => r(res.statusCode)));
+  ok(hostBad === 403, 'Host diferente de localhost é bloqueado (anti DNS-rebinding)', String(hostBad));
+  const listen = f => { try { return fs.readFileSync(f, 'utf8').split('\n').slice(1).map(l => l.trim().split(/\s+/)).filter(c => c[3] === '0A' && c[1] && c[1].endsWith(':' + PORT.toString(16).toUpperCase().padStart(4, '0'))).map(c => c[1].split(':')[0]); } catch { return null; } };
+  const a4 = listen('/proc/net/tcp'), a6 = listen('/proc/net/tcp6');
+  if (a4 === null) console.log('  - (verificação de endereço de escuta só em Linux; pulada)'); else ok(a4.length > 0 && a4.every(h => h === '0100007F') && (a6 || []).length === 0, 'escuta só em 127.0.0.1 (não aparece na rede)', `ipv4: ${a4.join(',')} ipv6: ${(a6 || []).join(',')}`);
+  console.log('2) Registrar arquivos pelo caminho');
+  ok((await reg('video', path.join(T, 'nao-existe.mp4')))._s === 400, 'arquivo inexistente: erro claro', (await reg('video', path.join(T, 'nao-existe.mp4'))).error);
+  ok((await reg('video', SRC1))._s === 400, 'pasta no lugar de arquivo: recusado');
+  ok((await reg('video', 'relativo/a.mp4'))._s === 400, 'caminho relativo: recusado');
+  ok((await reg('video', TXT))._s === 422, 'arquivo que não é mídia: recusado com explicação');
+  for (const [r, f] of [['video', V], ['video', V2], ['watermark', WM], ['outro', OU]]) { const a = await reg(r, f); ok(a._s === 200 && a.file.meta.w > 0, `registrado: ${r} ${path.basename(f)}`, a.error || `${a.file && a.file.meta.w}x${a.file && a.file.meta.h}`); }
+  ok(fs.readdirSync(path.join(DATA, 'uploads')).length === 0, 'nada foi copiado: a pasta de envios do app está vazia');
+  console.log('3) Processar: resultados na pasta escolhida, com nomes legíveis');
+  const st = await call('GET', '/api/state'); ok(st.desktop === true && st.outDir === OUT, 'servidor informa modo desktop e a pasta de saída', st.outDir);
+  console.log('   ', JSON.stringify(await call('POST', '/api/process')));
+  const s = await wait(); ok(s.jobs.length === 2 && s.jobs.every(j => j.status === 'done'), 'os 2 vídeos concluíram', s.jobs.map(j => j.status + (j.error ? ': ' + j.error : '')).join(' | '));
+  const names = fs.readdirSync(OUT).sort(); ok(JSON.stringify(names) === JSON.stringify(['a_final (1).mp4', 'a_final.mp4']), 'arquivos finais com nome legível, sem colisão entre dois "a.mp4"', names.join(', '));
+  for (const n of names) { const o = JSON.parse(x('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_streams', path.join(OUT, n)]).toString()).streams.find(a => a.codec_type === 'video'); ok(o.width === 1080 && o.height === 1920 && o.codec_name === 'h264', `${n}: 1080x1920 H.264`); }
+  ok(Object.entries(before).every(([f, h]) => sha(f) === h), 'arquivos originais intactos (sha1 igual)');
+  console.log('4) Remover da lista NÃO apaga o original');
+  const v1 = s && st.files.find(f => f.name === 'a.mp4'); await call('DELETE', '/api/files/' + v1.id);
+  ok(fs.existsSync(V) && fs.existsSync(V2) && sha(V) === before[V], 'após remover da lista, o arquivo original continua no disco');
+  console.log('5) Limpeza automática não toca nos seus arquivos (TTL minúsculo, reiniciando o servidor)');
+  p.kill(); await new Promise(r => setTimeout(r, 400)); fs.writeFileSync(path.join(OUT, 'velho.tmp.mp4'), 'x'); fs.writeFileSync(path.join(OUT, 'minhas-notas.txt'), 'x'); const old = new Date(Date.now() - 864e5); for (const f of ['velho.tmp.mp4', 'minhas-notas.txt']) fs.utimesSync(path.join(OUT, f), old, old);
+  p = srv({ TTL_HOURS: '0.0001' }); await up(); await new Promise(r => setTimeout(r, 800)); const left = fs.readdirSync(OUT).sort();
+  ok(left.includes('a_final.mp4') && left.includes('a_final (1).mp4') && left.includes('minhas-notas.txt'), 'vídeos finais e outros arquivos da pasta permanecem', left.join(', '));
+  ok(!left.includes('velho.tmp.mp4'), 'só sobra de gravação interrompida (.tmp.mp4) é limpa');
+  ok(fs.existsSync(V2) && fs.existsSync(WM) && fs.existsSync(OU), 'originais continuam intactos');
+  console.log('6) Fechar o app não deixa FFmpeg órfão');
+  mk(path.join(SRC1, 'longo.mp4'), '-f', 'lavfi', '-i', 'testsrc2=s=1920x1080:r=30:d=90', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast');
+  const L = await reg('video', path.join(SRC1, 'longo.mp4')); ok(L._s === 200, 'vídeo longo registrado'); await call('POST', '/api/process');
+  let prog = 0; for (let i = 0; i < 80 && prog <= 0; i++) { await new Promise(r => setTimeout(r, 250)); const j = (await call('GET', '/api/state')).jobs.find(k => k.status === 'processing'); prog = j ? j.progress : 0; }
+  const ffs = () => spawnSync('pgrep', ['-f', `ffmpeg.*${OUT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`]).stdout.toString().trim();
+  ok(ffs() !== '', 'FFmpeg está rodando durante o processamento'); p.kill('SIGTERM'); await new Promise(r => setTimeout(r, 1200));
+  ok(ffs() === '', 'ao fechar o servidor, o FFmpeg também é encerrado');
+  console.log(fails ? `\n${fails} verificação(ões) FALHARAM — ${T}` : '\nTUDO OK'); process.exit(fails ? 1 : 0);
+})().catch(e => { console.error('FALHOU:', e); process.exit(1); });

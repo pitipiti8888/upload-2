@@ -1,0 +1,8 @@
+#!/bin/sh
+# Carimbo - inicia o servidor no seu computador (Linux/Mac).
+cd "$(dirname "$0")" || exit 1
+command -v node >/dev/null || { echo "Node.js nao encontrado. Instale a versao LTS em https://nodejs.org"; exit 1; }
+command -v ffmpeg >/dev/null || { echo "FFmpeg nao encontrado. Linux: sudo apt install ffmpeg   Mac: brew install ffmpeg"; exit 1; }
+( sleep 2; (xdg-open http://localhost:3000 || open http://localhost:3000) >/dev/null 2>&1 ) &
+echo "Carimbo em http://localhost:3000  (Ctrl+C para parar)"
+exec node server.js

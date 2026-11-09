@@ -1,0 +1,369 @@
+'use strict';
+// Carimbo — marca d'água (chroma key) + vídeo de encerramento em lote. Sem dependências: só Node 22+ e FFmpeg.
+const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
+const { spawn, execFile } = require('child_process'), { pipeline } = require('stream/promises');
+const pexec = require('util').promisify(execFile);
+const E = process.env, PORT = +E.PORT || 3000, DATA = path.resolve(E.DATA_DIR || 'data');
+const TTL = (+E.TTL_HOURS || 72) * 36e5, CONC = +E.CONCURRENCY || 1, PRESET = E.X264_PRESET || 'veryfast', CRF = E.X264_CRF || '18';
+const DESKTOP = E.DESKTOP === '1', HOST = E.HOST || (DESKTOP ? '127.0.0.1' : ''); // app de desktop: só aceita conexões do próprio computador
+const FFMPEG = E.FFMPEG_PATH || 'ffmpeg', FFPROBE = E.FFPROBE_PATH || 'ffprobe';   // o aplicativo embute os dois
+const DIR = { tmp: DATA + '/tmp', up: DATA + '/uploads', out: E.OUT_DIR ? path.resolve(E.OUT_DIR) : DATA + '/out', fr: DATA + '/frames' };
+for (const d of Object.values(DIR)) fs.mkdirSync(d, { recursive: true });
+const CHUNK = Math.max(1, +E.CHUNK_MB || 16) * 2 ** 20, RESERVE = 512 * 2 ** 20; // tamanho de cada parte do upload; reserva de disco
+const OW = 1080, OH = 1920; // todo vídeo final sai em 1080x1920 (9:16)
+
+// ---------- estado persistido ----------
+const SF = DATA + '/state.json';
+// Ajustes de chroma key e marca d'água (escalas 0-100 inspiradas no CapCut; não são os valores do aplicativo)
+const DEF = { color: '#00ff00', intensity: 60, shadow: 0, edge: 30, smooth: 30, wpx: 300, x: 0, y: 100, opacity: 100 };
+const RANGE = { intensity: [0, 100], shadow: [0, 100], edge: [0, 100], smooth: [0, 100], wpx: [16, 1080], x: [0, 100], y: [0, 100], opacity: [0, 100] };
+function norm(c) {
+  const o = { ...DEF }; if (!c) return o;
+  if (typeof c.color === 'string' && /^#[0-9a-f]{6}$/i.test(c.color)) o.color = c.color.toLowerCase();
+  for (const k in RANGE) if (c[k] !== undefined && isFinite(+c[k])) o[k] = Math.min(RANGE[k][1], Math.max(RANGE[k][0], Math.round(+c[k])));
+  return o;
+}
+let S = { config: { ...DEF }, files: {}, jobs: {} };
+try { S = Object.assign(S, JSON.parse(fs.readFileSync(SF, 'utf8'))); } catch {}
+S.config = norm(S.config);
+for (const j of Object.values(S.jobs)) if (j.status === 'processing') j.status = 'queued'; // retoma após reinício
+let tm; const save = () => { clearTimeout(tm); tm = setTimeout(() => fs.writeFile(SF, JSON.stringify(S), () => {}), 200); };
+const sizeOf = p => { try { return fs.statSync(p).size; } catch { return 0; } };
+const pub = f => ({ id: f.id, role: f.role, name: f.name, size: f.size, meta: f.meta });
+const byAt = (a, b) => a.at - b.at, list = o => Object.values(o).sort(byAt);
+const find = r => list(S.files).find(f => f.role === r);
+const fpath = f => f.abs || `${DIR.up}/${f.file}`; // f.abs: arquivo do usuário usado no lugar (nunca copiado nem apagado)
+const json = (res, c, o) => { res.writeHead(c, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
+const body = req => new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > 1e6) no(new Error('corpo grande demais')); }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch (e) { no(e); } }); req.on('error', no); });
+
+const gb = n => n >= 2 ** 30 ? (n / 2 ** 30).toFixed(1) + ' GB' : (n / 2 ** 20).toFixed(0) + ' MB';
+const freeBytes = () => { try { const s = fs.statfsSync(DATA); return s.bavail * s.bsize; } catch { return Infinity; } };
+// Diagnóstico: o servidor confere FFmpeg/FFprobe, encoders e filtros usados e avisa a interface
+const HL = { ok: true, problems: [] };
+async function checkTools() {
+  const p = [];
+  for (const [t, bin] of [['ffmpeg', FFMPEG], ['ffprobe', FFPROBE]]) try { await pexec(bin, ['-version']); } catch { p.push(DESKTOP ? `O ${t} embutido no aplicativo não foi encontrado. Reinstale o aplicativo.` : `${t} não encontrado no servidor. Instale o FFmpeg (Ubuntu/Debian: sudo apt install ffmpeg) e reinicie o servidor.`); }
+  if (!p.length) try {
+    const enc = (await pexec(FFMPEG, ['-hide_banner', '-encoders'], { maxBuffer: 1e7 })).stdout, fl = (await pexec(FFMPEG, ['-hide_banner', '-filters'], { maxBuffer: 1e7 })).stdout;
+    if (!/libx264/.test(enc)) p.push('Seu FFmpeg não tem o encoder libx264 (H.264). Instale uma versão completa (apt install ffmpeg).');
+    if (!/ aac /.test(enc)) p.push('Seu FFmpeg não tem o encoder AAC.');
+    const miss = ['geq', 'alphamerge', 'alphaextract', 'erosion', 'boxblur', 'overlay', 'colorchannelmixer', 'concat'].filter(f => !new RegExp(` ${f} `).test(fl));
+    if (miss.length) p.push('Seu FFmpeg não tem os filtros: ' + miss.join(', ') + '. Instale a versão 5.0 ou superior.');
+  } catch {}
+  HL.problems = p; HL.ok = !p.length;
+  setTimeout(checkTools, HL.ok ? 6e4 : 5e3).unref();
+}
+function friendly(e, err = '', code) { // traduz falhas do FFmpeg em causa + como resolver
+  if (e && e.code === 'ENOENT') return new Error(DESKTOP ? 'O FFmpeg embutido não foi encontrado. Reinstale o aplicativo.' : 'FFmpeg não encontrado no servidor. Instale-o (Ubuntu/Debian: sudo apt install ffmpeg) e reinicie o servidor.');
+  if (/No space left/i.test(err)) return new Error(`O disco encheu. Libere espaço em ${DIR.out} (apague vídeos finais antigos ou escolha outra pasta) e clique em INICIAR PROCESSAMENTO para tentar de novo.`);
+  if (/Error opening output|Permission denied/i.test(err)) return new Error(`Não consigo gravar em ${DIR.out}. Verifique se a pasta existe e se você tem permissão de escrita nela.`);
+  if (/moov atom not found|Invalid data found/i.test(err)) return new Error('O arquivo de vídeo está corrompido ou incompleto. Exporte-o de novo e envie outra vez.');
+  if (/No such filter|Unknown encoder|Encoder .* not found/i.test(err)) return new Error('Seu FFmpeg está incompleto (falta filtro ou o encoder libx264). Instale a versão completa 5.0 ou superior.');
+  return new Error(`FFmpeg falhou (código ${code}). Detalhe: ` + err.trim().split('\n').slice(-2).join(' | '));
+}
+const kids = new Set(); // processos filhos (FFmpeg)
+process.on('exit', () => { for (const k of kids) try { k.kill('SIGKILL'); } catch {} });
+for (const sg of ['SIGINT', 'SIGTERM']) process.on(sg, () => process.exit(0));
+function ffBuf(args, res) { // roda o FFmpeg e devolve o stdout (usado nas prévias); cancela se o navegador abortar
+  return new Promise((ok, no) => {
+    const p = spawn(FFMPEG, args), out = []; let err = ''; kids.add(p); p.on('close', () => kids.delete(p));
+    p.stdout.on('data', d => out.push(d)); p.stderr.on('data', d => { err = (err + d).slice(-1500); });
+    p.on('error', e => no(friendly(e))); p.on('close', c => c === 0 ? ok(Buffer.concat(out)) : no(friendly(null, err, c)));
+    if (res) res.on('close', () => p.kill('SIGKILL'));
+  });
+}
+
+// ---------- ffprobe ----------
+async function probe(p) {
+  const { stdout } = await pexec(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', p], { maxBuffer: 1e7 });
+  const j = JSON.parse(stdout), v = j.streams.find(s => s.codec_type === 'video'), a = j.streams.find(s => s.codec_type === 'audio');
+  if (!v) throw new Error('arquivo sem trilha de vídeo');
+  let w = v.width, h = v.height;
+  const rot = Math.abs(+((v.side_data_list || []).find(x => 'rotation' in x) || {}).rotation || +(v.tags && v.tags.rotate) || 0);
+  if (rot === 90 || rot === 270) [w, h] = [h, w];
+  const fr = s => { const [n, d] = String(s || '0/1').split('/').map(Number); return d ? n / d : 0; };
+  let fpsStr = v.avg_frame_rate, fps = fr(fpsStr);
+  if (!(fps >= 1 && fps <= 240)) { fpsStr = v.r_frame_rate; fps = fr(fpsStr); }
+  if (!(fps >= 1 && fps <= 240)) fpsStr = '30';
+  return { w, h, fpsStr, dur: +v.duration || +j.format.duration || 0, audio: !!a, sr: a ? +a.sample_rate || 48000 : 48000, ch: a ? +a.channels : 2,
+    still: ['png', 'mjpeg', 'bmp', 'webp', 'tiff'].includes(v.codec_name) && /image|_pipe|webp/.test(j.format.format_name) };
+}
+
+// ---------- upload em partes, retomável ----------
+const ROLES = ['video', 'watermark', 'outro'];
+const uid = (role, key) => crypto.createHash('sha1').update(role + '|' + key).digest('hex').slice(0, 20);
+const validUp = b => ROLES.includes(b.role) && b.size > 0 && typeof b.name === 'string' && b.name && typeof b.key === 'string' && b.key;
+function rmFile(f) {
+  if (!f.abs) fs.rmSync(fpath(f), { force: true }); // NUNCA apaga o arquivo original do usuário
+  fs.rmSync(`${DIR.fr}/${f.id}.jpg`, { force: true }); delete S.files[f.id];
+  for (const j of Object.values(S.jobs)) if (j.fileId === f.id && j.status !== 'done') delete S.jobs[j.id];
+  save();
+}
+async function upInit(req, res) {
+  const b = await body(req); if (!validUp(b)) return json(res, 400, { error: 'dados inválidos' });
+  if (!HL.ok) return json(res, 503, { error: HL.problems.join(' ') });
+  const id = uid(b.role, b.key); if (S.files[id]) return json(res, 200, { id, done: true });
+  const p = `${DIR.tmp}/${id}.part`; let off = sizeOf(p);
+  if (off > b.size) { fs.rmSync(p, { force: true }); off = 0; }
+  const need = b.size - off, free = freeBytes();
+  if (need + RESERVE > free) return json(res, 507, { error: `Espaço insuficiente no servidor: faltam ${gb(need + RESERVE - free)} (arquivo: ${gb(need)}, livre: ${gb(free)}, reserva: 512 MB). Libere espaço em ${DATA} ou aponte DATA_DIR para um disco maior.` });
+  json(res, 200, { id, offset: off, chunk: CHUNK });
+}
+async function upPut(req, res, id, off) {
+  const p = `${DIR.tmp}/${id}.part`, cur = sizeOf(p);
+  if (off !== cur) { req.resume(); return json(res, 409, { offset: cur }); } // cliente retoma de onde o servidor parou
+  await pipeline(req, fs.createWriteStream(p, { flags: 'a' })); // streaming direto para o disco
+  json(res, 200, { offset: sizeOf(p) });
+}
+async function upDone(req, res, id) {
+  const b = await body(req); if (!validUp(b) || uid(b.role, b.key) !== id) return json(res, 400, { error: 'dados inválidos' });
+  if (S.files[id]) return json(res, 200, { file: pub(S.files[id]) });
+  const p = `${DIR.tmp}/${id}.part`, cur = sizeOf(p);
+  if (cur !== b.size) return json(res, 409, { offset: cur });
+  const ext = (path.extname(b.name).toLowerCase().replace(/[^a-z0-9.]/g, '') || '.bin').slice(0, 8), fn = id + ext, dst = `${DIR.up}/${fn}`;
+  fs.renameSync(p, dst);
+  let meta; try { meta = await probe(dst); } catch (e) {
+    if (e.code === 'ENOENT') { fs.renameSync(dst, p); await checkTools(); return json(res, 503, { error: HL.problems[0] || 'ffprobe não encontrado no servidor.' }); } // mantém o envio para retomar depois
+    fs.rmSync(dst, { force: true }); return json(res, 422, { error: 'Arquivo de mídia inválido: ' + (e.code ? 'o FFmpeg não reconheceu o formato. Envie um vídeo (MP4, MOV, MKV…) ou imagem válidos.' : e.message) });
+  }
+  if (b.role !== 'video') for (const f of list(S.files)) if (f.role === b.role) rmFile(f); // marca d'água e encerramento: só um de cada
+  S.files[id] = { id, role: b.role, name: b.name, size: cur, file: fn, meta, at: Date.now() }; save();
+  json(res, 200, { file: pub(S.files[id]) });
+}
+
+// ---------- filtros: 9:16 (cover) e marca d'água ----------
+// Vídeo sempre preenche 1080x1920 sem distorcer: amplia até cobrir e corta o excesso no centro.
+const VF = F => `fps=${F},scale='trunc(iw*sar)':ih,setsar=1,scale=${OW}:${OH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${OW}:${OH},setsar=1,format=yuv420p`;
+const M = 32; // margem de segurança (3% da largura)
+const ovPos = c => `x='${M}+(main_w-overlay_w-${2 * M})*${c.x}/100':y='${M}+(main_h-overlay_h-${2 * M})*${c.y}/100'`; // x:0%=esquerda, y:100%=base
+const hex2rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+function wmFilter(c, inL, outL) {
+  const [KR, KG, KB] = hex2rgb(c.color), KM = Math.max(KR, KG, KB, 1), SH = c.shadow / 100;
+  const sim = (c.intensity / 200).toFixed(4), ramp = (0.02 + 0.2 * c.smooth / 100).toFixed(4);          // intensidade -> tolerância; suavização -> rampa
+  const choke = Math.round(c.edge / 100 * 3), blur = Math.round(c.smooth / 100 * 3), op = c.opacity / 100; // bordas -> 0-3 px; suavização -> desfoque 0-3 px
+  const r = 'r(X,Y)', g = 'g(X,Y)', b = 'b(X,Y)';
+  // d = distância RGB normalizada (0..1) até a cor-chave. "Sombra" também aceita versões mais escuras da cor-chave.
+  const pre = `st(0,clip(max(${r},max(${g},${b}))/${KM},${(1 - SH).toFixed(3)},1));` +
+    `st(1,sqrt(min(pow(${r}-${KR},2)+pow(${g}-${KG},2)+pow(${b}-${KB},2),pow(${r}-${KR}*ld(0),2)+pow(${g}-${KG}*ld(0),2)+pow(${b}-${KB}*ld(0),2))/195075));` +
+    `st(2,clip((ld(1)-${sim})/${ramp},0,1));`;
+  const spill = KG >= KR && KG >= KB ? 'g' : KB > KR ? 'b' : ''; // remove o respingo da cor nas bordas semitransparentes
+  const dsp = (v, o1, o2) => `${pre}${v}-(1-ld(2))*max(0,${v}-max(${o1},${o2}))`;
+  const ex = { r, g: spill === 'g' ? dsp(g, r, b) : g, b: spill === 'b' ? dsp(b, r, g) : b, a: `${pre}ld(2)*alpha(X,Y)` };
+  const geq = Object.entries(ex).map(([k, v]) => `${k}='${v}'`).join(':');
+  return `${inL}scale=${c.wpx}:-2:flags=lanczos,format=rgba,geq=${geq},format=rgba,split[kc][ka];` +
+    `[ka]alphaextract,${'erosion,'.repeat(choke)}${blur ? `boxblur=${blur}:1,` : ''}format=gray[kal];` +
+    `[kc][kal]alphamerge,format=rgba${op < 1 ? `,colorchannelmixer=aa=${op.toFixed(3)}` : ''}${outL}`;
+}
+async function frameOf(f) { // quadro do 1º vídeo, já em 9:16, usado de fundo na prévia
+  const p = `${DIR.fr}/${f.id}.jpg`; if (sizeOf(p)) return p;
+  await ffBuf(['-v', 'error', '-y', '-ss', String(Math.min(1, f.meta.dur / 2)), '-i', fpath(f), '-frames:v', '1', '-vf',
+    `scale='trunc(iw*sar)':ih,setsar=1,scale=${OW}:${OH}:force_original_aspect_ratio=increase,crop=${OW}:${OH}`, '-q:v', '2', p]);
+  return p;
+}
+async function preview(req, res) { // renderiza a prévia com o MESMO filtro do processamento final
+  const b = await body(req), c = norm(b), wm = find('watermark');
+  if (!wm) return json(res, 400, { error: 'Envie a marca d\'água para ver a prévia.' });
+  const fv = b.bg !== 'checker' && list(S.files).find(f => f.role === 'video');
+  const base = fv ? ['-i', await frameOf(fv)] : ['-f', 'lavfi', '-i', `nullsrc=s=${OW}x${OH},geq=lum='if(mod(floor(X/48)+floor(Y/48),2),58,84)':cb=128:cr=128`];
+  const fc = `[0:v]scale=${OW}:${OH},setsar=1,format=yuv420p[b];${wmFilter(c, '[1:v]', '[w]')};[b][w]overlay=${ovPos(c)}:format=auto,scale=540:960:flags=lanczos,format=yuvj420p[o]`;
+  const img = await ffBuf(['-v', 'error', '-y', ...base, '-i', fpath(wm), '-filter_complex', fc, '-map', '[o]', '-frames:v', '1', '-c:v', 'mjpeg', '-q:v', '3', '-f', 'image2pipe', 'pipe:1'], res);
+  res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' }); res.end(img);
+}
+async function source(res, id) { // marca original (miniatura) para o conta-gotas
+  const f = S.files[id]; if (!f || f.role !== 'watermark') return json(res, 404, { error: 'não encontrado' });
+  const img = await ffBuf(['-v', 'error', '-i', fpath(f), '-frames:v', '1', '-vf', "scale='min(360,iw)':-2", '-c:v', 'png', '-f', 'image2pipe', 'pipe:1'], res);
+  res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' }); res.end(img);
+}
+
+// ---------- aplicativo de desktop: usa o arquivo no lugar, sem enviar nem copiar ----------
+async function register(req, res) {
+  if (!DESKTOP) return json(res, 404, { error: 'não encontrado' });
+  const b = await body(req);
+  if (!ROLES.includes(b.role) || typeof b.path !== 'string' || !path.isAbsolute(b.path)) return json(res, 400, { error: 'Não consegui descobrir onde esse arquivo está no computador. Use o botão de escolher arquivos ou arraste o arquivo para dentro da janela do aplicativo.' });
+  if (!HL.ok) return json(res, 503, { error: HL.problems.join(' ') });
+  let st; try { st = fs.statSync(b.path); } catch { return json(res, 400, { error: `Arquivo não encontrado: ${b.path}` }); }
+  if (!st.isFile() || !st.size) return json(res, 400, { error: 'Isso não é um arquivo de vídeo ou imagem.' });
+  const id = uid(b.role, `${b.path}|${st.size}|${Math.round(st.mtimeMs)}`);
+  if (S.files[id]) return json(res, 200, { file: pub(S.files[id]) });
+  let meta; try { meta = await probe(b.path); } catch (e) { return json(res, 422, { error: 'Arquivo de mídia inválido: ' + (e.code ? 'o FFmpeg não reconheceu o formato. Escolha um vídeo (MP4, MOV, MKV…) ou imagem válidos.' : e.message) }); }
+  if (b.role !== 'video') for (const f of list(S.files)) if (f.role === b.role) rmFile(f);
+  S.files[id] = { id, role: b.role, name: path.basename(b.path), size: st.size, abs: b.path, meta, at: Date.now() }; save();
+  json(res, 200, { file: pub(S.files[id]) });
+}
+
+// ---------- fila + FFmpeg ----------
+let active = 0;
+function pump() {
+  while (active < CONC) {
+    const j = list(S.jobs).find(x => x.status === 'queued'); if (!j) return;
+    active++; j.status = 'processing'; j.progress = 0; save();
+    work(j).catch(e => { j.status = 'error'; j.error = String(e.message || e); })
+      .finally(() => { active--; save(); pump(); });
+  }
+}
+function outName(j) { // nome legível e único na pasta de saída: video_final.mp4, video_final (1).mp4...
+  const safe = j.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 180) || 'video_final.mp4';
+  const used = new Set(list(S.jobs).filter(x => x.id !== j.id).map(x => x.out)); let n = safe, k = 1;
+  while (used.has(n) || fs.existsSync(`${DIR.out}/${n}`)) n = safe.replace(/(\.[^.]*)?$/, ` (${k++})$1`);
+  return n;
+}
+async function work(j) {
+  const f = S.files[j.fileId], wm = find('watermark'), ou = find('outro');
+  if (!f || !wm || !ou) throw new Error('vídeo original, marca d\'água ou encerramento ausente');
+  for (const x of [f, wm, ou]) if (!fs.existsSync(fpath(x))) throw new Error(`O arquivo "${x.name}" não está mais em ${fpath(x)} (foi movido, renomeado ou apagado). Remova-o da lista e adicione de novo.`);
+  const m = f.meta, c = norm(j.cfg), SR = m.sr, L = m.ch === 1 ? 'mono' : 'stereo', F = m.fpsStr;
+  const aud = (i, has, d, n) => (has
+    ? `[${i}:a]aformat=sample_fmts=fltp:sample_rates=${SR}:channel_layouts=${L},apad,atrim=end=${d},asetpts=PTS-STARTPTS`
+    : `anullsrc=r=${SR}:cl=${L},atrim=end=${d},asetpts=PTS-STARTPTS`) + `[a${n}]`;
+  const fc = [
+    `[0:v]${VF(F)}[b]`,                                                                   // original -> 1080x1920, fps preservado
+    wmFilter(c, '[1:v]', '[w]'),                                                          // marca d'água (chroma key) pronta
+    `[b][w]overlay=${ovPos(c)}:shortest=1:format=auto,format=yuv420p[v0]`,               // marca só no vídeo original
+    `[2:v]${VF(F)}[v1]`,                                                                  // encerramento também em 1080x1920, sem marca
+    aud(0, m.audio, m.dur, 0), aud(2, ou.meta.audio, ou.meta.dur, 1),
+    '[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]'].join(';');                                // encerramento só começa quando o original termina
+  const lim = String(m.dur + 1);
+  const wmIn = wm.meta.still ? ['-loop', '1', '-framerate', F, '-t', lim, '-i', fpath(wm)] : ['-stream_loop', '-1', '-t', lim, '-i', fpath(wm)];
+  j.out = outName(j); const out = `${DIR.out}/${j.out}`, tmp = out + '.tmp.mp4';
+  const args = ['-hide_banner', '-nostdin', '-y', '-progress', 'pipe:1', '-nostats', '-i', fpath(f), ...wmIn, '-i', fpath(ou), '-filter_complex', fc,
+    '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-profile:v', 'high', '-preset', PRESET, '-crf', CRF, '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-ar', String(SR), tmp];
+  const total = (m.dur + ou.meta.dur) || 1; let err = '';
+  try {
+    await new Promise((ok, no) => {
+      const p = spawn(FFMPEG, args); let buf = ''; kids.add(p); p.on('close', () => kids.delete(p));
+      p.stdout.on('data', d => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); const t = /^out_time_us=(\d+)/.exec(l); if (t) j.progress = Math.min(0.99, t[1] / 1e6 / total); } });
+      p.stderr.on('data', d => { err = (err + d).slice(-1500); });
+      p.on('error', e => no(friendly(e)));
+      p.on('close', code => code === 0 ? ok() : no(friendly(null, err, code)));
+    });
+  } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
+  fs.renameSync(tmp, out); Object.assign(j, { status: 'done', progress: 1, out: path.basename(out), outSize: sizeOf(out), doneAt: Date.now() });
+}
+function startAll() {
+  if (!HL.ok) return { code: 503, error: HL.problems.join(' ') };
+  const miss = ['watermark', 'outro'].filter(r => !find(r)).map(r => r === 'outro' ? 'o vídeo de encerramento' : 'a marca d\'água');
+  if (miss.length) return { code: 400, error: 'Falta enviar ' + miss.join(' e ') + '.' };
+  let n = 0;
+  for (const f of list(S.files).filter(x => x.role === 'video')) {
+    const ex = list(S.jobs).find(j => j.fileId === f.id); if (ex && ex.status !== 'error') continue; if (ex) delete S.jobs[ex.id];
+    const id = crypto.randomBytes(8).toString('hex'), name = path.basename(f.name, path.extname(f.name)) + '_final.mp4';
+    S.jobs[id] = { id, fileId: f.id, name, status: 'queued', progress: 0, cfg: { ...S.config }, at: Date.now() + n++ };
+  }
+  if (!n) return { code: 400, error: 'Não há vídeos novos para processar.' };
+  save(); pump(); return { code: 200, queued: n };
+}
+
+// ---------- download (Range) e ZIP64 em streaming ----------
+function sendFile(req, res, p, name) {
+  const total = sizeOf(p); let s = 0, e = total - 1, code = 200;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+  if (m && (m[1] || m[2])) {
+    if (m[1]) { s = +m[1]; if (m[2]) e = Math.min(+m[2], e); } else s = Math.max(0, total - +m[2]);
+    if (s > e) { res.writeHead(416, { 'Content-Range': `bytes */${total}` }); return res.end(); }
+    code = 206;
+  }
+  res.writeHead(code, { 'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes', 'Content-Length': e - s + 1,
+    'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(name)}`, ...(code === 206 && { 'Content-Range': `bytes ${s}-${e}/${total}` }) });
+  pipeline(fs.createReadStream(p, { start: s, end: e }), res).catch(() => {});
+}
+async function zipAll(res) {
+  const jobs = list(S.jobs).filter(j => j.status === 'done');
+  if (!jobs.length) return json(res, 404, { error: 'nenhum vídeo concluído' });
+  const plan = [], names = new Set();
+  for (const j of jobs) {
+    let n = j.name, k = 1; while (names.has(n)) n = j.name.replace(/(\.[^.]*)?$/, ` (${k++})$1`); names.add(n);
+    plan.push({ j, nb: Buffer.from(n), size: sizeOf(`${DIR.out}/${j.out}`) });
+  }
+  const total = plan.reduce((a, e) => a + 30 + e.nb.length + 20 + e.size + 24 + 46 + e.nb.length + 28, 98); // tamanho exato do ZIP (método "store")
+  res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Length': total, 'Content-Disposition': 'attachment; filename="carimbo-videos.zip"' });
+  let off = 0;
+  const drain = () => new Promise(ok => { const f = () => { res.off('drain', f); res.off('close', f); ok(); }; res.once('drain', f); res.once('close', f); });
+  const W = async b => { if (res.destroyed) throw new Error('cliente desconectou'); if (!res.write(b)) await drain(); off += b.length; };
+  const d = new Date(), dT = d.getHours() << 11 | d.getMinutes() << 5 | d.getSeconds() >> 1, dD = (d.getFullYear() - 1980) << 9 | (d.getMonth() + 1) << 5 | d.getDate();
+  const ents = [];
+  for (const { j, nb } of plan) {
+    const h = Buffer.alloc(30 + nb.length + 20), start = off;
+    h.writeUInt32LE(0x04034b50, 0); h.writeUInt16LE(45, 4); h.writeUInt16LE(0x0808, 6); h.writeUInt16LE(dT, 10); h.writeUInt16LE(dD, 12);
+    h.writeUInt32LE(0xFFFFFFFF, 18); h.writeUInt32LE(0xFFFFFFFF, 22); h.writeUInt16LE(nb.length, 26); h.writeUInt16LE(20, 28);
+    nb.copy(h, 30); h.writeUInt16LE(1, 30 + nb.length); h.writeUInt16LE(16, 32 + nb.length); // extra zip64 (tamanhos reais vão no data descriptor)
+    await W(h); let crc = 0, size = 0;
+    for await (const c of fs.createReadStream(`${DIR.out}/${j.out}`)) { crc = zlib.crc32(c, crc); size += c.length; await W(c); }
+    const dd = Buffer.alloc(24); dd.writeUInt32LE(0x08074b50, 0); dd.writeUInt32LE(crc, 4); dd.writeBigUInt64LE(BigInt(size), 8); dd.writeBigUInt64LE(BigInt(size), 16);
+    await W(dd); ents.push({ nb, crc, size, start });
+  }
+  const cd0 = off;
+  for (const e of ents) {
+    const c = Buffer.alloc(46 + e.nb.length + 28);
+    c.writeUInt32LE(0x02014b50, 0); c.writeUInt16LE(45, 4); c.writeUInt16LE(45, 6); c.writeUInt16LE(0x0808, 8); c.writeUInt16LE(dT, 12); c.writeUInt16LE(dD, 14);
+    c.writeUInt32LE(e.crc, 16); c.writeUInt32LE(0xFFFFFFFF, 20); c.writeUInt32LE(0xFFFFFFFF, 24); c.writeUInt16LE(e.nb.length, 28); c.writeUInt16LE(28, 30);
+    c.writeUInt32LE(0xFFFFFFFF, 42); e.nb.copy(c, 46); const x = 46 + e.nb.length;
+    c.writeUInt16LE(1, x); c.writeUInt16LE(24, x + 2); c.writeBigUInt64LE(BigInt(e.size), x + 4); c.writeBigUInt64LE(BigInt(e.size), x + 12); c.writeBigUInt64LE(BigInt(e.start), x + 20);
+    await W(c);
+  }
+  const z64 = off, n = BigInt(ents.length), z = Buffer.alloc(98);
+  z.writeUInt32LE(0x06064b50, 0); z.writeBigUInt64LE(44n, 4); z.writeUInt16LE(45, 12); z.writeUInt16LE(45, 14);
+  z.writeBigUInt64LE(n, 24); z.writeBigUInt64LE(n, 32); z.writeBigUInt64LE(BigInt(z64 - cd0), 40); z.writeBigUInt64LE(BigInt(cd0), 48);
+  z.writeUInt32LE(0x07064b50, 56); z.writeBigUInt64LE(BigInt(z64), 64); z.writeUInt32LE(1, 72);
+  z.writeUInt32LE(0x06054b50, 76); z.writeUInt16LE(0xFFFF, 84); z.writeUInt16LE(0xFFFF, 86); z.writeUInt32LE(0xFFFFFFFF, 88); z.writeUInt32LE(0xFFFFFFFF, 92);
+  await W(z); res.end();
+}
+
+// ---------- limpeza automática ----------
+function sweep() {
+  const old = t => Date.now() - t > TTL, busy = new Set(list(S.jobs).filter(j => j.status === 'processing').map(j => j.fileId));
+  for (const j of list(S.jobs)) if (!DESKTOP && j.status === 'done' && old(j.doneAt)) { fs.rmSync(`${DIR.out}/${j.out}`, { force: true }); delete S.jobs[j.id]; }
+  for (const f of list(S.files)) if (f.role === 'video' && !f.abs && old(f.at) && !busy.has(f.id) && !list(S.jobs).some(j => j.fileId === f.id && j.status === 'queued')) rmFile(f);
+  const keep = new Set(list(S.jobs).map(j => j.out));
+  for (const [d, ok] of [[DIR.tmp, () => false], [DIR.out, DESKTOP ? n => !n.endsWith('.tmp.mp4') || active > 0 : n => keep.has(n) || active > 0 && n.endsWith('.tmp.mp4')]])
+    for (const n of fs.readdirSync(d)) { const p = `${d}/${n}`; if (!ok(n) && old(fs.statSync(p).mtimeMs)) fs.rmSync(p, { force: true }); }
+  save();
+}
+setInterval(sweep, 36e5).unref();
+
+// ---------- HTTP ----------
+const srv = http.createServer(async (req, res) => {
+  const u = new URL(req.url, 'http://x'), p = u.pathname, m = req.method; let a;
+  try {
+    if (DESKTOP) { // só o próprio aplicativo pode falar com o servidor local
+      const host = (req.headers.host || '').replace(/:\d+$/, '');
+      if (host !== '127.0.0.1' && host !== 'localhost') { res.writeHead(403); return res.end(); }
+      if (m !== 'GET' && req.headers['x-carimbo'] !== '1') return json(res, 403, { error: 'requisição bloqueada' });
+    }
+    if (m === 'GET' && p === '/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return fs.createReadStream(__dirname + '/index.html').pipe(res); }
+    if (m === 'GET' && p === '/api/state') return json(res, 200, { config: S.config, chunk: CHUNK, free: freeBytes(), health: HL, desktop: DESKTOP, outDir: DIR.out, files: list(S.files).map(pub),
+      jobs: list(S.jobs).map(j => ({ id: j.id, fileId: j.fileId, name: j.name, out: j.out, status: j.status, progress: j.progress, error: j.error, outSize: j.outSize })) });
+    if (m === 'POST' && p === '/api/config') { S.config = norm(await body(req)); save(); return json(res, 200, S.config); }
+    if (m === 'POST' && p === '/api/preview') return await preview(req, res);
+    if (m === 'POST' && p === '/api/register') return await register(req, res);
+    if (m === 'GET' && (a = /^\/api\/source\/([a-f0-9]{20})$/.exec(p))) return await source(res, a[1]);
+    if (m === 'POST' && p === '/api/uploads') return await upInit(req, res);
+    if (m === 'PUT' && (a = /^\/api\/uploads\/([a-f0-9]{20})$/.exec(p))) return await upPut(req, res, a[1], +u.searchParams.get('offset'));
+    if (m === 'POST' && (a = /^\/api\/uploads\/([a-f0-9]{20})\/complete$/.exec(p))) return await upDone(req, res, a[1]);
+    if (m === 'DELETE' && (a = /^\/api\/files\/([a-f0-9]{20})$/.exec(p))) {
+      const f = S.files[a[1]]; if (!f) return json(res, 404, { error: 'não encontrado' });
+      if (list(S.jobs).some(j => j.fileId === f.id && j.status === 'processing')) return json(res, 409, { error: 'vídeo em processamento' });
+      rmFile(f); return json(res, 200, {});
+    }
+    if (m === 'POST' && p === '/api/process') { const r = startAll(); return json(res, r.code, r); }
+    if (m === 'GET' && (a = /^\/api\/download\/([a-f0-9]{16})$/.exec(p))) {
+      const j = S.jobs[a[1]]; if (!j || j.status !== 'done') return json(res, 404, { error: 'não encontrado' });
+      return sendFile(req, res, `${DIR.out}/${j.out}`, j.name);
+    }
+    if (m === 'GET' && p === '/api/zip') return await zipAll(res);
+    json(res, 404, { error: 'não encontrado' });
+  } catch (e) { if (!res.headersSent) json(res, 500, { error: String(e.message) }); else res.destroy(); }
+});
+process.on('uncaughtException', e => console.error('Erro inesperado (o servidor continua rodando):', e));
+process.on('unhandledRejection', e => console.error('Erro inesperado (o servidor continua rodando):', e));
+srv.on('error', e => {
+  if (e.code === 'EADDRINUSE') console.error(`\n⚠ A porta ${PORT} já está em uso, provavelmente por outro Carimbo ainda aberto. Feche-o (Ctrl+C no terminal dele) ou use outra porta:\n   Linux/Mac: PORT=3001 node server.js\n   Windows (cmd): set PORT=3001 && node server.js\n`);
+  else console.error('Não foi possível iniciar o servidor:', e.message);
+  process.exit(1);
+});
+srv.requestTimeout = 0; srv.timeout = 0; srv.keepAliveTimeout = 65e3; // chunks lentos e downloads de vários GB não podem estourar timeout
+srv.listen(...[PORT, ...(HOST ? [HOST] : []), async () => {
+  console.log(`Carimbo em http://localhost:${PORT}  (dados: ${DATA}, partes de ${CHUNK / 2 ** 20} MB, livre: ${gb(freeBytes())})`);
+  if (+process.versions.node.split('.')[0] < 22) console.error(`⚠ Node ${process.versions.node}: o ZIP precisa do Node 22.2 ou superior.`);
+  await checkTools(); if (!HL.ok) console.error('\n⚠ PROBLEMAS NO SERVIDOR:\n - ' + HL.problems.join('\n - ') + '\n');
+  sweep(); pump();
+}]);

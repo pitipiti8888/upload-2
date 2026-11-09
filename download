@@ -1,0 +1,104 @@
+// Uso: node server.js (outro terminal) e então: node test/e2e.js    (URL=http://host:porta para outro endereço)
+const { execFileSync: x, spawnSync } = require('child_process'), fs = require('fs'), os = require('os'), path = require('path');
+const B = process.env.URL || 'http://localhost:3000', T = process.env.OUT || fs.mkdtempSync(path.join(os.tmpdir(), 'carimbo-'));
+fs.mkdirSync(T, { recursive: true });
+let fails = 0; const ok = (c, m, d = '') => { console.log(`  ${c ? '✔' : '✘'} ${m}${d ? '  (' + d + ')' : ''}`); if (!c) fails++; };
+const mk = (n, ...a) => { x('ffmpeg', ['-v', 'error', '-y', ...a, path.join(T, n)]); return path.join(T, n); };
+const SINE = d => ['-f', 'lavfi', '-i', `sine=f=440:d=${d}`];
+const F = {
+  // paisagem 16:9, 30 fps, com áudio, quadrado branco 200x200 no centro (serve para detectar distorção)
+  v1: mk('v1.mp4', '-f', 'lavfi', '-i', 'color=c=0x203040:s=1280x720:r=30:d=6', ...SINE(6), '-vf', 'drawbox=x=540:y=260:w=200:h=200:color=white:t=fill', '-shortest', '-pix_fmt', 'yuv420p'),
+  // vertical 720x1280, 25 fps, SEM áudio, cor sólida rosa (prova a remoção do verde: o rosa deve aparecer onde era verde)
+  v2: mk('v2.mp4', '-f', 'lavfi', '-i', 'color=c=0xcc3377:s=720x1280:r=25:d=4', '-pix_fmt', 'yuv420p'),
+  // quadrado 1:1, 24 fps, com áudio
+  v3: mk('v3.mp4', '-f', 'lavfi', '-i', 'color=c=0x336699:s=1000x1000:r=24:d=3', ...SINE(3), '-shortest', '-pix_fmt', 'yuv420p'),
+  // encerramento 16:9 de outra resolução/fps, com áudio
+  ou: mk('outro.mp4', '-f', 'lavfi', '-i', 'color=c=navy:s=640x360:r=24:d=3', ...SINE(3), '-shortest', '-pix_fmt', 'yuv420p'),
+  // marca 400x160 com fundo verde puro, faixa de verde ESCURO (topo), faixa de verde CLARO (base), caixa branca e retângulo vermelho
+  wm: mk('wm.png', '-f', 'lavfi', '-i', 'color=c=0x00ff00:s=400x160', '-vf',
+    'drawbox=x=0:y=0:w=400:h=40:color=0x006e00:t=fill,drawbox=x=0:y=140:w=400:h=20:color=0x50ff50:t=fill,drawbox=x=20:y=60:w=360:h=80:color=white:t=fill,drawbox=x=60:y=80:w=100:h=40:color=red:t=fill', '-frames:v', '1'),
+};
+const j = async (m, u, b) => { const r = await fetch(B + u, { method: m, headers: { 'Content-Type': 'application/json' }, body: b && JSON.stringify(b) }); return Object.assign(await r.json(), { _s: r.status }); };
+async function upload(role, p, chunk = 256 * 1024, cut = 0) {
+  const buf = fs.readFileSync(p), meta = { role, name: path.basename(p), size: buf.length, key: p + buf.length };
+  let i = await j('POST', '/api/uploads', meta); if (i._s !== 200) throw new Error(i.error);
+  const put = (off, end) => fetch(`${B}/api/uploads/${i.id}?offset=${off}`, { method: 'PUT', body: buf.subarray(off, end) });
+  if (cut) { await put(0, cut); i = await j('POST', '/api/uploads', meta); ok(i.offset === cut, 'upload interrompido e retomado do byte certo', `offset ${i.offset}`); }
+  let off = i.offset || 0; while (off < buf.length) { const e = Math.min(off + chunk, buf.length), r = await put(off, e); if (r.status !== 200) throw new Error('PUT ' + r.status); off = e; }
+  const c = await j('POST', `/api/uploads/${i.id}/complete`, meta); if (c._s !== 200) throw new Error(c.error); return c.file;
+}
+const probe = p => JSON.parse(x('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', p]).toString());
+// região RGB de um quadro (t em segundos, ou null para imagem); devolve Buffer rgb24
+const region = (f, t, X, Y, W, H) => spawnSync('ffmpeg', ['-v', 'error', ...(t == null ? [] : ['-ss', String(t)]), '-i', f, '-frames:v', '1', '-vf', `format=rgb24,crop=${W}:${H}:${X}:${Y}`, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'], { maxBuffer: 1e8 }).stdout;
+const px = (f, t, X, Y) => [...region(f, t, X, Y, 1, 1)];
+const near = (a, b, tol = 10) => a.every((v, i) => Math.abs(v - b[i]) <= tol);
+const greenish = (buf) => { let n = 0; for (let i = 0; i < buf.length; i += 3) if (buf[i + 1] - Math.max(buf[i], buf[i + 2]) > 40) n++; return n; };
+const pvFile = async (cfg, name) => { const r = await fetch(B + '/api/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bg: 'checker', ...cfg }) }); if (!r.ok) throw new Error('preview ' + r.status); const p = path.join(T, name); fs.writeFileSync(p, Buffer.from(await r.arrayBuffer())); return p; };
+const gray = c => Math.abs(c[0] - c[1]) < 12 && Math.abs(c[1] - c[2]) < 12;
+
+(async () => {
+  console.log('1) Envio em partes (um deles interrompido no meio)');
+  await upload('video', F.v1, 8 * 1024, Math.floor(fs.statSync(F.v1).size / 2)); await upload('video', F.v2); await upload('video', F.v3); await upload('watermark', F.wm); await upload('outro', F.ou);
+  console.log('2) Controles de chroma key e marca d’água (prévia gerada pelo mesmo filtro do resultado final)');
+  // marca padrão: 300x120 px (em 1080), canto inferior esquerdo; na prévia (metade): x0=16, y0=884, 150x60
+  const base = await pvFile({}, 'pv_base.jpg'), at = (f, X, Y) => px(f, null, X, Y);
+  ok(fs.statSync(base).size > 1000 && at(base, 300, 400).length === 3, 'prévia gerada pelo servidor (540x960)');
+  const strip = (f) => at(f, 91, 892);                                    // faixa de verde ESCURO (topo da marca)
+  ok(!gray(strip(await pvFile({ shadow: 0 }, 'pv_sh0.jpg'))), 'Sombra 0: verde escuro permanece', strip(await pvFile({ shadow: 0 }, 'pv_sh0.jpg')).join(','));
+  ok(gray(strip(await pvFile({ shadow: 80 }, 'pv_sh80.jpg'))), 'Sombra 80: verde escuro é removido', strip(await pvFile({ shadow: 80 }, 'pv_sh80.jpg')).join(','));
+  const light = f => at(f, 91, 941);                                      // faixa de verde CLARO (base da marca)
+  ok(!gray(light(await pvFile({ intensity: 20 }, 'pv_i20.jpg'))), 'Intensidade 20: verde claro permanece');
+  ok(gray(light(await pvFile({ intensity: 60 }, 'pv_i60.jpg'))), 'Intensidade 60: verde claro é removido');
+  const white = f => { const b = region(f, null, 16, 884, 150, 60); let n = 0; for (let i = 0; i < b.length; i += 3) if (b[i] > 225 && b[i + 1] > 225 && b[i + 2] > 225) n++; return n; };
+  const w0 = white(await pvFile({ edge: 0, smooth: 0 }, 'pv_e0.jpg')), w100 = white(await pvFile({ edge: 100, smooth: 0 }, 'pv_e100.jpg'));
+  ok(w100 < w0, 'Bordas 100 encolhem a máscara em relação a Bordas 0', `${w0} → ${w100} px brancos`);
+  const o50 = at(await pvFile({ opacity: 50 }, 'pv_o50.jpg'), 91, 925); ok(o50[0] > 120 && o50[0] < 205, 'Opacidade 50%: caixa branca semitransparente', o50.join(','));
+  const tr = await pvFile({ x: 100, y: 0 }, 'pv_tr.jpg');
+  ok(at(tr, 449, 40)[0] > 225 && !(at(tr, 91, 925)[0] > 225), 'Posição X=100, Y=0 move a marca para o canto superior direito');
+  const wb = (() => { const b = region(path.join(T, 'pv_big.jpg'), null, 16, 824, 300, 120); let n = 0; for (let i = 0; i < b.length; i += 3) if (b[i] > 225 && b[i + 1] > 225 && b[i + 2] > 225) n++; return n; })();
+  await pvFile({ wpx: 600, edge: 0, smooth: 0 }, 'pv_big.jpg'); const wb2 = (() => { const b = region(path.join(T, 'pv_big.jpg'), null, 16, 824, 300, 120); let n = 0; for (let i = 0; i < b.length; i += 3) if (b[i] > 225 && b[i + 1] > 225 && b[i + 2] > 225) n++; return n; })();
+  ok(wb2 > 3 * w0, 'Tamanho 600 px: marca com o dobro da largura (≈4x a área)', `${w0} → ${wb2} px brancos`);
+
+  console.log('3) Processamento em lote (3 vídeos: 16:9, 9:16 e 1:1)');
+  console.log('   ', JSON.stringify(await j('POST', '/api/process')));
+  let s; for (let n = 0; n < 240; n++) { s = await j('GET', '/api/state'); if (s.jobs.every(k => k.status === 'done' || k.status === 'error')) break; await new Promise(r => setTimeout(r, 500)); }
+  const want = { 'v1_final.mp4': { src: F.v1, orig: 6 }, 'v2_final.mp4': { src: F.v2, orig: 4 }, 'v3_final.mp4': { src: F.v3, orig: 3 } };
+  const outs = {};
+  for (const k of s.jobs) {
+    console.log(`4) ${k.name}`); ok(k.status === 'done', 'processamento concluído', k.error || ''); if (k.status !== 'done') continue;
+    const p = path.join(T, k.name); const r = await fetch(`${B}/api/download/${k.id}`); fs.writeFileSync(p, Buffer.from(await r.arrayBuffer())); outs[k.name] = p;
+    const o = probe(p), v = o.streams.find(a => a.codec_type === 'video'), a = o.streams.find(a => a.codec_type === 'audio'), src = probe(want[k.name].src).streams.find(a => a.codec_type === 'video');
+    ok(v.width === 1080 && v.height === 1920, 'resolução 1080 x 1920 (9:16)', `${v.width}x${v.height}`);
+    ok(v.codec_name === 'h264' && v.pix_fmt === 'yuv420p' && /mp4/.test(o.format.format_name), 'H.264, yuv420p, contêiner MP4', `${v.codec_name} ${v.pix_fmt} ${o.format.format_name}`);
+    ok(a && a.codec_name === 'aac', 'áudio AAC', a && a.codec_name);
+    ok(v.r_frame_rate === src.r_frame_rate, 'FPS original preservado', `${src.r_frame_rate} → ${v.r_frame_rate}`);
+    ok(Math.abs(+o.format.duration - (want[k.name].orig + 3)) < 0.2, 'duração = original + encerramento', `${(+o.format.duration).toFixed(2)}s`);
+    ok(Math.abs(+a.duration - +v.duration) < 0.15, 'áudio e vídeo com a mesma duração (sincronia)', `${(+a.duration).toFixed(2)} vs ${(+v.duration).toFixed(2)}`);
+    ok(fs.readFileSync(p).subarray(0, 4e6).includes('crf=18.0'), 'codificado com CRF 18');
+    const dec = spawnSync('ffmpeg', ['-v', 'error', '-i', p, '-f', 'null', '-']); ok(dec.status === 0 && !dec.stderr.length, 'arquivo decodifica por inteiro sem erros (reproduzível)');
+  }
+  const p2 = outs['v2_final.mp4'], p1 = outs['v1_final.mp4'];
+  console.log('5) Conferência visual (v2 = fundo rosa sólido; marca padrão 300x120 px em x=32, y=1768)');
+  if (p2) {
+    const b = region(p2, 1, 32, 1768, 300, 120);
+    ok(greenish(b) === 0, 'nenhum pixel verde restou na área da marca (fundo verde removido)', `${greenish(b)} px verdes`);
+    ok(near(px(p2, 1, 37, 1805), [204, 51, 119], 14), 'onde era verde aparece o vídeo (rosa)', px(p2, 1, 37, 1805).join(','));
+    ok(near(px(p2, 1, 232, 1828), [255, 255, 255], 12), 'corpo branco da marca preservado', px(p2, 1, 232, 1828).join(','));
+    ok(near(px(p2, 1, 112, 1828), [255, 0, 0], 20), 'retângulo vermelho da marca preservado', px(p2, 1, 112, 1828).join(','));
+    ok(near(px(p2, 1, 1000, 100), [204, 51, 119], 14) && near(px(p2, 1, 600, 960), [204, 51, 119], 14), 'resto do vídeo sem marca');
+    ok(near(px(p2, 3.9, 232, 1828), [255, 255, 255], 12), 'marca presente até o fim do original (t=3,9 s)');
+    ok(near(px(p2, 4.1, 232, 1828), [0, 0, 128], 12) && near(px(p2, 4.5, 112, 1828), [0, 0, 128], 12), 'encerramento só depois do original e sem marca (t=4,1 e 4,5 s)');
+  }
+  if (p1) {
+    const b = region(p1, 1, 200, 300, 680, 1300), W = 680; let x0 = 1e9, x1 = -1, y0 = 1e9, y1 = -1;
+    for (let i = 0; i < b.length; i += 3) if (b[i] > 235 && b[i + 1] > 235 && b[i + 2] > 235) { const n = i / 3, X = n % W, Y = Math.floor(n / W); x0 = Math.min(x0, X); x1 = Math.max(x1, X); y0 = Math.min(y0, Y); y1 = Math.max(y1, Y); }
+    const w = x1 - x0 + 1, h = y1 - y0 + 1; ok(Math.abs(w - h) <= 3 && Math.abs(w - 533) <= 6, 'corte central sem distorção: quadrado de 200 px segue quadrado (≈533 px)', `${w}x${h}`);
+    ok(Math.abs(200 + (x0 + x1) / 2 - 540) <= 4 && Math.abs(300 + (y0 + y1) / 2 - 960) <= 4, 'e continua centralizado');
+  }
+  console.log('6) Download');
+  if (s.jobs[0]) { const r = await fetch(`${B}/api/download/${s.jobs[0].id}`, { headers: { Range: 'bytes=100-199' } }); ok(r.status === 206 && (await r.arrayBuffer()).byteLength === 100, 'download com Range (retomável)'); }
+  const z = await fetch(B + '/api/zip'), zb = Buffer.from(await z.arrayBuffer()); fs.writeFileSync(path.join(T, 'todos.zip'), zb);
+  ok(+z.headers.get('content-length') === zb.length, 'ZIP com Content-Length exato', `${zb.length} bytes`);
+  const ut = spawnSync('unzip', ['-t', path.join(T, 'todos.zip')]); ok(ut.status === 0, 'ZIP íntegro (unzip -t)');
+  console.log(fails ? `\n${fails} verificação(ões) FALHARAM — arquivos em ${T}` : `\nTUDO OK — arquivos em ${T}`); process.exit(fails ? 1 : 0);
+})().catch(e => { console.error('FALHOU:', e); process.exit(1); });

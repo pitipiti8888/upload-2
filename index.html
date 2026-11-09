@@ -1,0 +1,10 @@
+# NÃO testado neste ambiente (sem Docker disponível ao escrever).
+# docker build -t carimbo . && docker run -p 3000:3000 -v /disco-grande:/data carimbo
+FROM node:22-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY server.js index.html package.json ./
+ENV DATA_DIR=/data
+VOLUME /data
+EXPOSE 3000
+CMD ["node", "server.js"]
